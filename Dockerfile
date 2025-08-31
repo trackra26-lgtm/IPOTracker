@@ -1,27 +1,22 @@
-# Base image includes Python + Chromium + Playwright browsers preinstalled
-FROM mcr.microsoft.com/playwright/python:v1.43.0-noble
+# Use the official Playwright Python image (with browsers preinstalled)
+FROM mcr.microsoft.com/playwright/python:v1.43.0-jammy
 
-# Make Python output unbuffered & no .pyc files
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+# Prevent .pyc files and ensure logs flush
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
-# Create app directory
+# Set workdir
 WORKDIR /app
 
-# Install deps first (better layer caching)
-COPY requirements.txt /app/requirements.txt
+# Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY . /app
+# Copy project files
+COPY . .
 
-# Playwright browsers already installed in this image, so no playwright install needed
+# Expose port for Render
+EXPOSE 10000
 
-# Render (and many PaaS) provide $PORT
-ENV PORT=8000
-
-# Expose for local testing (Render ignores EXPOSE, but it's handy locally)
-EXPOSE 8000
-
-# Start FastAPI with Uvicorn
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
+# Start the FastAPI app with uvicorn
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
