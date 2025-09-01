@@ -5,6 +5,9 @@ from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from pathlib import Path
 from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
+
 
 # ---------- Config ----------
 NASDAQ_IPO_URL = os.environ.get("NASDAQ_IPO_URL", "https://www.nasdaq.com/market-activity/ipos")
@@ -78,166 +81,153 @@ def send_email(new_ipos: list):
         s.sendmail(FROM_EMAIL, TO_EMAILS, msg.as_string())
     return {"sent": True, "to": TO_EMAILS}
 
-# ---------- Scraper ----------
-async def scrape_nasdaq_ipos():
+def _nasdaq_headers():
+    # Nasdaq’s API/CDN likes a real browser UA + referer
+    return {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.nasdaq.com/market-activity/ipos",
+        "Origin": "https://www.nasdaq.com",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+def _norm(s: str) -> str:
+    import re
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _make_item(row):
+    # Build a unified dict from various possible shapes
+    company = _norm(row.get("company", "") or row.get("companyName", "") or row.get("name", ""))
+    ticker  = _norm(row.get("symbol", "") or row.get("ticker", ""))
+    price   = _norm(row.get("priceRange", "") or row.get("price_range", ""))
+    shares  = _norm(row.get("shares", "") or row.get("sharesOffered", "") or row.get("shares_offered", ""))
+    date    = _norm(row.get("expectedDate", "") or row.get("expected_date", "") or row.get("date", ""))
+    market  = _norm(row.get("market", "") or row.get("exchange", ""))
+    href    = row.get("href", "") or row.get("link", "") or ""
+    # Underwriters may be a string or list
+    uw = row.get("leadUnderwriters") or row.get("underwriters") or row.get("lead_underwriters") or ""
+    if isinstance(uw, list):
+        uw = ", ".join([_norm(x) for x in uw])
+    banks = _norm(uw)
+
+    return {
+        "company": company,
+        "ticker": ticker,
+        "price_range": price,
+        "shares": shares,
+        "expected_date": date,
+        "market": market,
+        "href": href,
+        "underwriters": banks,
+    }
+
+def scrape_nasdaq_ipos():
     """
-    Scrape Nasdaq IPO calendar.
-    For each row: company, ticker, price range, shares, expected date, market, link.
-    Then open each detail link (capped / timeboxed) to extract lead underwriters if available.
-    Returns: list of IPO dicts.
+    Try Nasdaq's JSON API first (fast & reliable), then fall back to parsing HTML table
+    (server-side content) if the API format changes.
     """
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await browser.new_context()
-        page = await ctx.new_page()
-
-        await page.goto(NASDAQ_IPO_URL, wait_until="networkidle", timeout=120000)
-
-        # The calendar is a table. We'll query rows via JS to be resilient to minor DOM shifts.
-        rows = await page.evaluate("""
-        () => {
-          const data = [];
-          // Look for any table with the IPO columns (Company, Symbol, Price Range, Shares, Expected, Market)
-          const tables = Array.from(document.querySelectorAll('table'));
-          const target = tables.find(tbl => {
-            const ths = Array.from(tbl.querySelectorAll('thead th, tr th')).map(th => th.textContent.trim().toLowerCase());
-            return ths.some(h => h.includes('company')) &&
-                   ths.some(h => h.includes('symbol')) &&
-                   (ths.some(h => h.includes('expected')) || ths.some(h => h.includes('date')));
-          });
-          if (!target) return data;
-
-          const headerRow = target.querySelector('thead tr') || target.querySelector('tr');
-          const headers = Array.from(headerRow.querySelectorAll('th')).map(th => th.textContent.trim());
-          const idx = {}; headers.forEach((h,i)=> idx[h.toLowerCase()] = i);
-
-          function colIdx(opts) {
-            const keys = Object.keys(idx);
-            for (const opt of opts) {
-              const k = keys.find(k => k.includes(opt));
-              if (k != null) return idx[k];
-            }
-            return -1;
-          }
-
-          const iCompany = colIdx(['company']);
-          const iSymbol  = colIdx(['symbol','ticker']);
-          const iPrice   = colIdx(['price range','price']);
-          const iShares  = colIdx(['shares']);
-          const iDate    = colIdx(['expected','date']);
-          const iMarket  = colIdx(['market','exchange']);
-
-          const trs = Array.from(target.querySelectorAll('tbody tr'));
-          for (const tr of trs) {
-            const tds = Array.from(tr.querySelectorAll('td'));
-            if (!tds.length) continue;
-
-            const txt = i => (i>=0 && i<tds.length) ? (tds[i].textContent||'').trim() : '';
-
-            let href = '';
-            if (iCompany >= 0 && iCompany < tds.length) {
-              const a = tds[iCompany].querySelector('a');
-              if (a && a.href) href = a.href;
-            }
-
-            data.push({
-              company: txt(iCompany),
-              ticker:  txt(iSymbol),
-              price_range: txt(iPrice),
-              shares: txt(iShares),
-              expected_date: txt(iDate),
-              market: txt(iMarket),
-              href
-            });
-          }
-          return data;
-        }
-        """)
-
-        # Visit detail pages (capped) to extract lead underwriters
-        # We timebox each detail to keep the whole run under cron time budgets.
-        detailed = []
-        for i, row in enumerate(rows):
-            if i >= MAX_DETAIL_PAGES:
-                detailed.append({**row, "underwriters": ""})
-                continue
-            href = row.get("href", "")
-            underwriters = ""
-            if href:
-                try:
-                    dp = await ctx.new_page()
-                    await dp.goto(href, wait_until="domcontentloaded", timeout=DETAIL_TIMEOUT_MS)
-                    # Try common labels that appear on Nasdaq detail pages
-                    # We'll search for elements whose text contains 'Underwriter' and read nearby content.
-                    # Fallbacks try different patterns to be robust.
-                    underwriters = await dp.evaluate("""
-                    () => {
-                      const txt = (el) => (el && el.textContent || '').trim();
-                      // Strategy 1: find any dt/dd pair like "Lead underwriters" / value
-                      const dts = Array.from(document.querySelectorAll('dt,th'));
-                      for (const dt of dts) {
-                        const t = txt(dt).toLowerCase();
-                        if (t.includes('underwriter')) {
-                          // try next sibling (dd/td) or parent row's next cell
-                          let val = '';
-                          const dd = dt.nextElementSibling;
-                          if (dd) val = txt(dd);
-                          if (!val && dt.parentElement) {
-                              const tds = dt.parentElement.querySelectorAll('td,dd');
-                              if (tds.length >= 2) val = txt(tds[1]);
-                          }
-                          if (val) return val;
-                        }
-                      }
-                      // Strategy 2: look for label blocks
-                      const labels = Array.from(document.querySelectorAll('*')).filter(el => /underwriter/i.test(txt(el)));
-                      for (const el of labels) {
-                        // check siblings
-                        const sib = el.nextElementSibling;
-                        if (sib && txt(sib).length > 2) return txt(sib);
-                      }
-                      return '';
-                    }
-                    """)
-                    await dp.close()
-                except PWTimeout:
-                    underwriters = ""
-                except Exception:
-                    underwriters = ""
-            detailed.append({**row, "underwriters": norm(underwriters)})
-
-        await browser.close()
-
-    # Normalize and dedupe
     items = []
-    for r in detailed:
-        company = norm(r.get("company",""))
-        ticker  = norm(r.get("ticker",""))
-        price   = norm(r.get("price_range",""))
-        shares  = norm(r.get("shares",""))
-        date    = norm(r.get("expected_date",""))
-        market  = norm(r.get("market",""))
-        href    = r.get("href","").strip()
-        banks   = norm(r.get("underwriters",""))
 
-        # Build item
-        items.append({
-            "id": build_id(company, ticker, date),
-            "company": company,
-            "ticker": ticker,
-            "price_range": price,
-            "shares": shares,
-            "expected_date": date,
-            "market": market,
-            "href": href,
-            "underwriters": banks
-        })
+    # --- Attempt 1: Nasdaq JSON API variants ---
+    session = requests.Session()
+    session.headers.update(_nasdaq_headers())
+    api_candidates = [
+        # common endpoint (often returns upcoming & priced blocks)
+        "https://api.nasdaq.com/api/ipo/calendar",
+        # monthly slices (try current month)
+        f"https://api.nasdaq.com/api/ipo/calendar?date={datetime.utcnow():%Y-%m}",
+        # generic "all" (some deployments accept it)
+        "https://api.nasdaq.com/api/ipo/calendar?date=all",
+    ]
 
-    # Deduplicate by id
-    uniq = {}
+    for url in api_candidates:
+        try:
+            r = session.get(url, timeout=20)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            # Known shapes seen historically:
+            # 1) data["upcoming"]["rows"] / data["priced"]["rows"]
+            # 2) data["upcomingTable"]["rows"] / data["pricedTable"]["rows"]
+            # 3) data["data"]["rows"] (single table)
+            blocks = []
+            d = data.get("data", {})
+            for key in ("upcoming", "upcomingTable", "priced", "pricedTable"):
+                table = d.get(key) or {}
+                rows = table.get("rows")
+                if isinstance(rows, list) and rows:
+                    blocks.extend(rows)
+            # single-table fallback
+            if not blocks and isinstance(d.get("rows"), list):
+                blocks = d["rows"]
+
+            for row in blocks:
+                # Rows may contain "values" dict or be flat; flatten common shapes
+                payload = {}
+                if isinstance(row, dict):
+                    if "values" in row and isinstance(row["values"], dict):
+                        payload = row["values"]
+                    else:
+                        payload = row
+                item = _make_item(payload)
+                # Ensure we have at least company + date
+                if item["company"] or item["ticker"]:
+                    items.append(item)
+            if items:
+                break
+        except Exception:
+            continue
+
+    # --- Attempt 2: Fallback HTML parse (no JS) ---
+    if not items:
+        try:
+            html = session.get("https://www.nasdaq.com/market-activity/ipos", timeout=25).text
+            soup = BeautifulSoup(html, "html.parser")
+            # Find a table with columns "Company" and "Expected Date" (or similar)
+            tables = soup.select("table")
+            target = None
+            for tbl in tables:
+                headers = [(_norm(th.get_text())).lower() for th in tbl.select("thead th, tr th")]
+                if any("company" in h for h in headers) and (any("expected" in h for h in headers) or any("date" in h for h in headers)):
+                    target = tbl
+                    break
+            if target:
+                for tr in target.select("tbody tr"):
+                    tds = tr.find_all("td")
+                    if not tds:
+                        continue
+                    txts = [_norm(td.get_text()) for td in tds]
+                    a = tds[0].find("a")
+                    link = a["href"] if a and a.has_attr("href") else ""
+                    row = {
+                        "company": txts[0] if len(txts) > 0 else "",
+                        "ticker": "",  # sometimes not in the table; could be elsewhere
+                        "price_range": "",
+                        "shares": "",
+                        "expected_date": txts[-1] if txts else "",
+                        "market": "",
+                        "href": link,
+                        "underwriters": "",  # not usually present in SSR table
+                    }
+                    items.append(_make_item(row))
+        except Exception:
+            pass
+
+    # Final normalization + dedupe by our existing ID function
+    out = []
+    seen_ids = set()
     for it in items:
-        uniq[it["id"]] = it
-    return list(uniq.values())
+        it["company"] = _norm(it.get("company", ""))
+        it["ticker"] = _norm(it.get("ticker", ""))
+        it["expected_date"] = _norm(it.get("expected_date", ""))
+        it["id"] = build_id(it["company"], it["ticker"], it["expected_date"])
+        if it["id"] and it["id"] not in seen_ids:
+            seen_ids.add(it["id"])
+            out.append(it)
+    return out
+
 
 # ---------- Background job ----------
 async def do_run():
