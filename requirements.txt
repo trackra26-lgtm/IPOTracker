@@ -1,3 +1,5 @@
-fastapi==0.110.0
-uvicorn[standard]==0.27.1
-playwright==1.43.0
+fastapi
+uvicorn
+requests
+beautifulsoup4
+python-dotenv
