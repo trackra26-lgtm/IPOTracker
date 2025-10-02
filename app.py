@@ -1,9 +1,9 @@
 # app.py
-import os, re, json, smtplib
+import os, re, json, smtplib, time
 from email.mime.text import MIMEText
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Literal
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
+from pydantic import BaseModel, Field, root_validator, validator
+from alpaca_trade_api.rest import REST, APIError
 
 load_dotenv()  # load .env if present (for local/dev)
 
@@ -26,6 +29,15 @@ SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASS = os.environ.get("SMTP_PASS")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER or "notifier@example.com")
 TO_EMAILS = [e.strip() for e in os.environ.get("TO_EMAILS", "").split(",") if e.strip()]
+
+CAPITAL_IQ_PATH = Path(os.environ.get("CAPITAL_IQ_PATH", "capital_iq_healthcare.xlsx"))
+COMPANY_COLUMN = os.environ.get("COMPANY_COLUMN", "Company")
+TICKER_COLUMN = os.environ.get("TICKER_COLUMN", "Ticker")
+
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+DEFAULT_MAX_TRADES_PER_MINUTE = max(1, int(os.environ.get("MAX_TRADES_PER_MINUTE", "4")))
 
 app = FastAPI(title="IPO Tracker (Nasdaq)")
 
@@ -50,6 +62,418 @@ def load_cache() -> set:
 
 def save_cache(ids: set):
     CACHE_PATH.write_text(json.dumps(sorted(list(ids)), indent=2))
+
+# ---------------------- Capital IQ data helpers ----------------------
+_company_cache: Dict[str, Any] = {"mtime": None, "df": None}
+LOWER_IS_BETTER_HINTS = {"debt", "liability", "expense", "ratio", "turnover", "days", "burn"}
+
+
+def _normalize_column_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+
+
+def _resolve_column(df: pd.DataFrame, requested: str) -> Optional[str]:
+    target = _normalize_column_name(requested)
+    for col in df.columns:
+        if _normalize_column_name(str(col)) == target:
+            return col
+    return None
+
+
+def load_company_dataframe(force: bool = False) -> pd.DataFrame:
+    path = CAPITAL_IQ_PATH
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Capital IQ export not found at {path.resolve()}"
+        )
+
+    mtime = path.stat().st_mtime
+    cache = _company_cache
+    if not force and cache.get("df") is not None and cache.get("mtime") == mtime:
+        return cache["df"].copy()
+
+    df = pd.read_excel(path)
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError("Unable to parse Excel file into a dataframe")
+
+    df.columns = [str(col).strip() for col in df.columns]
+    df = df.dropna(how="all")
+
+    cache["df"] = df
+    cache["mtime"] = mtime
+    return df.copy()
+
+
+def _extract_text(row: Dict[str, Any], column: Optional[str], fallback: str = "") -> str:
+    if not column:
+        return fallback
+    value = row.get(column, fallback)
+    if isinstance(value, str):
+        return value.strip()
+    if pd.isna(value):
+        return fallback
+    return str(value)
+
+
+class MetricConfig(BaseModel):
+    column: str = Field(..., description="Column name in the dataset to use for scoring")
+    weight: float = Field(1.0, gt=0, description="Relative weight for this metric")
+    higher_is_better: bool = Field(
+        True, description="If false, lower values contribute a higher score"
+    )
+
+    @validator("column")
+    def column_required(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("column must be provided")
+        return value
+
+    @validator("weight")
+    def weight_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("weight must be greater than zero")
+        return value
+
+
+class RankingRequest(BaseModel):
+    metrics: Optional[List[MetricConfig]] = Field(
+        None, description="Custom metric configuration. If omitted the API will choose defaults"
+    )
+    top_n: int = Field(10, gt=0, le=200)
+    sector: Optional[str] = Field(
+        None, description="Optional sector filter. Matches the first column resembling 'Sector'"
+    )
+    industry: Optional[str] = Field(
+        None, description="Optional industry filter. Matches the first column resembling 'Industry'"
+    )
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "metrics": [
+                    {"column": "Revenue Growth %", "weight": 0.5, "higher_is_better": True},
+                    {"column": "EBITDA Margin %", "weight": 0.3, "higher_is_better": True},
+                    {"column": "Debt to Equity", "weight": 0.2, "higher_is_better": False},
+                ],
+                "top_n": 10,
+                "sector": "Healthcare",
+                "industry": "Pharmaceuticals",
+            }
+        }
+
+
+class TradeRequest(BaseModel):
+    metrics: Optional[List[MetricConfig]] = Field(
+        None, description="Metrics to derive ranking if symbols not provided"
+    )
+    top_n: int = Field(3, gt=0, le=50, description="How many ranked symbols to trade when symbols not provided")
+    symbols: Optional[List[str]] = Field(
+        None,
+        description="Explicit list of ticker symbols to trade. When omitted the ranking output is used",
+    )
+    side: Literal["buy", "sell"] = Field("buy")
+    notional: Optional[float] = Field(
+        None, gt=0, description="Dollar amount to trade per order (mutually exclusive with quantity)"
+    )
+    quantity: Optional[int] = Field(
+        None, gt=0, description="Share quantity per order (mutually exclusive with notional)"
+    )
+    time_in_force: str = Field("day", description="Alpaca time-in-force value, e.g. day or gtc")
+    max_trades_per_minute: int = Field(
+        DEFAULT_MAX_TRADES_PER_MINUTE, gt=0, le=60, description="Throttle rate for order submission"
+    )
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+
+    @validator("symbols", each_item=True)
+    def sanitize_symbols(cls, value: str) -> str:
+        symbol = (value or "").strip().upper()
+        if not symbol:
+            raise ValueError("symbols must be non-empty strings")
+        return symbol
+
+    @root_validator
+    def validate_trade_amount(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        notional = values.get("notional")
+        quantity = values.get("quantity")
+        if notional is None and quantity is None:
+            raise ValueError("either notional or quantity must be supplied")
+        if notional is not None and quantity is not None:
+            raise ValueError("notional and quantity are mutually exclusive")
+        return values
+
+
+def _default_metrics(df: pd.DataFrame) -> List[MetricConfig]:
+    numeric_cols = [
+        col
+        for col in df.columns
+        if (
+            pd.api.types.is_numeric_dtype(df[col])
+            and _normalize_column_name(col)
+            not in {
+                "",
+                _normalize_column_name(COMPANY_COLUMN),
+                _normalize_column_name(TICKER_COLUMN),
+            }
+        )
+    ]
+    selected = numeric_cols[: min(5, len(numeric_cols))]
+    if not selected:
+        raise ValueError("No numeric columns available to build a default ranking")
+
+    weight = 1.0 / len(selected)
+    metrics: List[MetricConfig] = []
+    for col in selected:
+        normalized = _normalize_column_name(col)
+        higher_is_better = not any(keyword in normalized for keyword in LOWER_IS_BETTER_HINTS)
+        metrics.append(
+            MetricConfig(column=col, weight=weight, higher_is_better=higher_is_better)
+        )
+    return metrics
+
+
+def _apply_optional_filter(df: pd.DataFrame, label: Optional[str], candidates: List[str]) -> pd.DataFrame:
+    if not label:
+        return df
+    lowered = label.strip().lower()
+    for candidate in candidates:
+        resolved = _resolve_column(df, candidate)
+        if resolved:
+            series = df[resolved].astype(str).str.strip().str.lower()
+            return df[series == lowered]
+    return df
+
+
+def _prepare_metric_series(df: pd.DataFrame, metrics: List[MetricConfig]) -> List[Dict[str, Any]]:
+    prepared: List[Dict[str, Any]] = []
+    total_weight = 0.0
+    for metric in metrics:
+        resolved = _resolve_column(df, metric.column)
+        if not resolved:
+            continue
+
+        values = pd.to_numeric(df[resolved], errors="coerce")
+        if values.notna().sum() == 0:
+            continue
+
+        total_weight += metric.weight
+        prepared.append(
+            {
+                "requested": metric.column,
+                "column": resolved,
+                "weight": metric.weight,
+                "higher_is_better": metric.higher_is_better,
+                "values": values,
+            }
+        )
+
+    if not prepared:
+        raise ValueError("None of the requested metrics are present in the dataset")
+
+    for item in prepared:
+        item["normalized_weight"] = item["weight"] / total_weight if total_weight else 0
+    return prepared
+
+
+def _calculate_scores(df: pd.DataFrame, prepared_metrics: List[Dict[str, Any]]) -> pd.DataFrame:
+    score = pd.Series(0.0, index=df.index)
+    contributions: Dict[str, pd.Series] = {}
+
+    for metric in prepared_metrics:
+        values = metric["values"].astype(float)
+        min_value = values.min()
+        max_value = values.max()
+        if pd.isna(min_value) or pd.isna(max_value) or max_value == min_value:
+            normalized = pd.Series(0.0, index=values.index)
+        else:
+            normalized = (values - min_value) / (max_value - min_value)
+        if not metric["higher_is_better"]:
+            normalized = 1 - normalized
+        normalized = normalized.fillna(0.0)
+        contribution = normalized * metric["normalized_weight"]
+        contributions[metric["column"]] = contribution
+        score = score + contribution
+
+    ranked = df.copy()
+    ranked["score"] = score
+    for col, series in contributions.items():
+        ranked[f"score__{col}"] = series
+    ranked = ranked.sort_values("score", ascending=False)
+    return ranked
+
+
+def compute_ranking(
+    metrics: Optional[List[MetricConfig]],
+    top_n: int,
+    sector: Optional[str] = None,
+    industry: Optional[str] = None,
+) -> Dict[str, Any]:
+    df = load_company_dataframe()
+    if df.empty:
+        raise ValueError("Capital IQ dataset is empty")
+
+    filtered = _apply_optional_filter(df, sector, ["sector", "gics sector"])
+    filtered = _apply_optional_filter(filtered, industry, ["industry", "gics industry", "industry group"])
+
+    if filtered.empty:
+        raise ValueError("No companies match the requested filters")
+
+    metric_config = metrics or _default_metrics(filtered)
+    prepared = _prepare_metric_series(filtered, metric_config)
+    ranked = _calculate_scores(filtered, prepared)
+    top_df = ranked.head(top_n)
+
+    company_col = _resolve_column(filtered, COMPANY_COLUMN) or COMPANY_COLUMN
+    ticker_col = _resolve_column(filtered, TICKER_COLUMN) or TICKER_COLUMN
+
+    records: List[Dict[str, Any]] = []
+    for idx, (_, row) in enumerate(top_df.iterrows(), start=1):
+        record = {
+            "rank": idx,
+            "company": _extract_text(row, company_col, fallback=""),
+            "ticker": _extract_text(row, ticker_col, fallback=""),
+            "score": round(float(row.get("score", 0.0)), 6),
+        }
+        for metric in prepared:
+            column_key = metric["column"]
+            contribution_key = f"score__{column_key}"
+            if contribution_key in row:
+                raw_value = row.get(column_key)
+                if pd.isna(raw_value):
+                    value = None
+                elif hasattr(raw_value, "item"):
+                    try:
+                        value = raw_value.item()
+                    except Exception:
+                        value = raw_value
+                else:
+                    value = raw_value
+                record[column_key] = value
+                record[f"normalized_{column_key}"] = round(
+                    float(row.get(contribution_key, 0.0)), 6
+                )
+        records.append(record)
+
+    metrics_used = [
+        {
+            "requested": metric["requested"],
+            "column": metric["column"],
+            "weight": round(float(metric["normalized_weight"]), 6),
+            "higher_is_better": metric["higher_is_better"],
+        }
+        for metric in prepared
+    ]
+
+    return {
+        "results": records,
+        "metrics_used": metrics_used,
+        "filters": {"sector": sector, "industry": industry},
+        "total_companies": int(len(filtered)),
+    }
+
+
+_alpaca_client: Optional[REST] = None
+
+
+def get_alpaca_client() -> REST:
+    if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
+        raise RuntimeError("Alpaca credentials are not configured")
+    global _alpaca_client
+    if _alpaca_client is None:
+        _alpaca_client = REST(
+            key_id=ALPACA_API_KEY,
+            secret_key=ALPACA_SECRET_KEY,
+            base_url=ALPACA_BASE_URL,
+            api_version="v2",
+        )
+    return _alpaca_client
+
+
+def _unique_symbols(symbols: List[str]) -> List[str]:
+    seen = set()
+    ordered: List[str] = []
+    for symbol in symbols:
+        sym = symbol.upper()
+        if sym and sym not in seen:
+            seen.add(sym)
+            ordered.append(sym)
+    return ordered
+
+
+def execute_trade_plan(req: TradeRequest) -> Dict[str, Any]:
+    ranking_context: Optional[Dict[str, Any]] = None
+    symbols: List[str] = []
+
+    if req.symbols:
+        symbols = req.symbols
+    else:
+        ranking_context = compute_ranking(
+            metrics=req.metrics,
+            top_n=req.top_n,
+            sector=req.sector,
+            industry=req.industry,
+        )
+        symbols = [
+            record.get("ticker")
+            for record in ranking_context.get("results", [])
+            if record.get("ticker")
+        ]
+        if not symbols:
+            raise ValueError("Ranking did not yield any tickers to trade")
+
+    ordered_symbols = _unique_symbols(symbols)
+    client = get_alpaca_client()
+    interval = 60.0 / max(1, req.max_trades_per_minute)
+    order_results: List[Dict[str, Any]] = []
+
+    for idx, symbol in enumerate(ordered_symbols):
+        payload = {
+            "symbol": symbol,
+            "side": req.side,
+            "type": "market",
+            "time_in_force": req.time_in_force,
+        }
+        if req.notional is not None:
+            payload["notional"] = req.notional
+        else:
+            payload["qty"] = req.quantity
+
+        try:
+            order = client.submit_order(**payload)
+            order_id = getattr(order, "id", None) or getattr(order, "order_id", None)
+            order_results.append(
+                {
+                    "symbol": symbol,
+                    "status": "submitted",
+                    "order_id": order_id,
+                    "submitted_payload": payload,
+                }
+            )
+        except APIError as exc:
+            order_results.append(
+                {
+                    "symbol": symbol,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+        except Exception as exc:
+            order_results.append(
+                {
+                    "symbol": symbol,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+
+        if idx < len(ordered_symbols) - 1 and interval > 0:
+            time.sleep(interval)
+
+    return {
+        "orders": order_results,
+        "symbols": ordered_symbols,
+        "ranking_context": ranking_context,
+    }
 
 def send_email(new_ipos: List[Dict[str, Any]]):
     if not (SMTP_USER and SMTP_PASS and TO_EMAILS):
@@ -234,6 +658,51 @@ async def do_run(force_email: bool = False):
 @app.get("/health")
 def health():
     return {"ok": True, "source": NASDAQ_IPO_URL}
+
+
+def _handle_ranking_error(exc: Exception) -> None:
+    if isinstance(exc, FileNotFoundError):
+        raise HTTPException(status_code=500, detail=str(exc))
+    raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/companies/rank")
+def get_ranked_companies(
+    top_n: int = 10,
+    sector: Optional[str] = None,
+    industry: Optional[str] = None,
+):
+    try:
+        return compute_ranking(metrics=None, top_n=top_n, sector=sector, industry=industry)
+    except Exception as exc:  # noqa: BLE001
+        _handle_ranking_error(exc)
+
+
+@app.post("/companies/rank")
+def post_ranked_companies(request: RankingRequest):
+    try:
+        return compute_ranking(
+            metrics=request.metrics,
+            top_n=request.top_n,
+            sector=request.sector,
+            industry=request.industry,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _handle_ranking_error(exc)
+
+
+@app.post("/alpaca/trade")
+def trade_with_alpaca(request: TradeRequest):
+    try:
+        result = execute_trade_plan(request)
+        return {"ok": True, **result}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
 
 def _check_token(request: Request) -> bool:
     if not SECRET_TOKEN:
