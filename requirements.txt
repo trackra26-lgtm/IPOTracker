@@ -6,5 +6,5 @@ python-dotenv
 numpy
 pandas
 yfinance
-
 matplotlib
+investpy
